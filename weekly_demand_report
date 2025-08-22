@@ -1,0 +1,164 @@
+from math import ceil
+import streamlit as st
+from simple_salesforce import Salesforce
+import pandas as pd
+import sys
+import json
+
+st.title("Salesforce Demand Report")
+
+credentials = {}
+
+try:
+    with open('../salesforce.json', 'r') as f:
+        credentials = json.load(f)
+except Exception as e:
+    print(f"Loading Json Error: {e}")
+    sys.exit(1)
+
+product_sku_map = {
+    "Ext. Cable 0.2m": "ACC-IH-CHAIN-0001",
+    "Ext. Cable 1m": "ACC-IH-CHAIN-0002",
+    "Ext. Cable 3m": "ACC-IH-CHAIN-0003",
+    "Locknut": "RM-TP-LOCKN-0001",
+    "Chase Nipple": "RM-TP-NIPPL-0002",
+    "EDG": "PR-IH-REVE2-0001",
+    "LTE-TG1WWG": "RM-TP-MODEM-0001",
+    "Coil CT 16\"": "PR-TP-CCT500-0001",
+    "Coil CT 24\"": "PR-TP-CCT500-0005",
+    "Hinged CT": "PR-TP-HCT200-0002",
+    "Smart CTs": "PR-IH-REVE2-0010",
+    "HCIM": "PR-IH-REVE2-0007",
+    "Splicing Connector": "RM-TP-CONNE-0001",
+    "BUD Box": "PK-IH-REVE2-0007",
+    "BUD Box Insert": "PK-IH-REVE2-0008",
+    "HCIM Sleeve": "PK-IH-REVE2-0006",
+    "Smart CT Sleeve": "PK-IH-REVE2-0005",
+    "EDG Paper End Caps": "PK-IH-REVE2-0011",
+    "Master Box": "PK-IH-REVE2-0001",
+    "Warning Sticker": "PK-IH-COMMO-0003",
+    "LTE-Antenna": "ACC-TP-ANTEN-0001",
+    "LTE-Ext. Antenna Base": "ACC-TP-ANTEN-0003"
+}
+
+def get_sku(product):
+    return product_sku_map.get(product, "")
+
+try:
+
+
+    sf = Salesforce(username=credentials['salesforce_username'], 
+                    password=credentials['salesforce_password'], 
+                    security_token=credentials['salesforce_security_token'])
+
+    report_id = '00OJw000003RkBVMA0'
+
+    # Query the report
+    report = sf.restful(f"/analytics/reports/{report_id}")
+    #st.subheader("Raw Salesforce Report Object")
+    #st.json(report)
+    #st.write("Report object fields:", list(report.keys()))
+
+    # --- Build mapping from factMap key to groupingsDown labels ---
+    def build_grouping_label_map(report):
+        grouping_map = {}
+        groupings_down = report['groupingsDown']['groupings']
+        # First level: quarters
+        for q_idx, quarter in enumerate(groupings_down):
+            quarter_label = quarter['label']
+            # Second level: products
+            for p_idx, product in enumerate(quarter['groupings']):
+                product_label = product['label']
+                # factMap key is like "0_0!T" for first quarter, first product
+                key = f"{q_idx}_{p_idx}!T"
+                grouping_map[key] = [quarter_label, product_label]
+        return grouping_map
+
+    grouping_label_map = build_grouping_label_map(report)
+
+    # Build columns list (prepend grouping labels)
+    columns = ['Quarter', 'Product'] + [col for col in report['reportMetadata']['detailColumns']]
+    rows = []
+
+
+    for key, fact in report['factMap'].items():
+        if 'rows' in fact and key in grouping_label_map:
+            for row in fact['rows']:
+                row_data = [cell.get('label', '') for cell in row['dataCells']]
+                # Prepend grouping labels
+                row_with_labels = grouping_label_map[key] + row_data
+                rows.append(row_with_labels)
+
+
+    if rows:
+        # Fill empty cells with '-'
+        rows = [[cell if cell not in (None, "") else '-' for cell in row] for row in rows]
+        df = pd.DataFrame(rows, columns=columns)
+        st.dataframe(df)
+
+        # --- Group by Product and sum Quantity ---
+        # Convert Quantity column to numeric (remove $ and commas if needed)
+        df['Quantity'] = pd.to_numeric(df['QUANTITY'], errors='coerce')
+        grouped = df.groupby(['Product'], as_index=False)['Quantity'].sum()
+        grouped_q = df.groupby(['Product', 'Quarter'], as_index=False)['Quantity'].sum()
+        grouped_q = grouped_q.sort_values(by='Quarter')
+        st.subheader("Sum of Quantity by Product")
+        st.dataframe(grouped_q)
+
+
+        # --- Custom aggregation for "Core Gateway" and "4G" ---
+        # 1. Aggregate all "Core Gateway" products as "EDG"
+        edg_quantity = grouped[grouped['Product'].str.contains("Core Gateway", na=False)]['Quantity'].sum()
+
+        # 2. For "Core Gateway" products that contain "4G", sum their quantity for "TG1WWG"
+        tg1wwg_quantity = grouped[grouped['Product'].str.contains("Core Gateway", na=False) & grouped['Product'].str.contains("4G", na=False)]['Quantity'].sum()
+
+        # 3. Remove all "Core Gateway" rows from grouped
+        grouped = grouped[~grouped['Product'].str.contains("Core Gateway", na=False)]
+
+        large_current_ct_quantity = grouped[grouped['Product'].str.contains("Coil CT 16\"|Coil CT 24\"|Hinged CT", na=False)]['Quantity'].sum()
+        smartct_count = grouped[grouped['Product'].str.contains("Smart CTs", na=False)]['Quantity'].sum()
+        hcim_count = ceil(large_current_ct_quantity / 3)
+
+        # 4. Append new rows for "EDG" and "TG1WWG" if their quantities > 0
+        if edg_quantity > 0:
+            grouped = pd.concat([grouped, pd.DataFrame([{'Product': 'EDG', 'Quantity': edg_quantity}])], ignore_index=True)
+            grouped = pd.concat([grouped, pd.DataFrame([{'Product': 'Ext. Cable 0.2m', 'Quantity': edg_quantity*3}])], ignore_index=True)
+            grouped = pd.concat([grouped, pd.DataFrame([{'Product': 'Ext. Cable 1m', 'Quantity': edg_quantity*3}])], ignore_index=True)
+            grouped = pd.concat([grouped, pd.DataFrame([{'Product': 'Ext. Cable 3m', 'Quantity': edg_quantity*3}])], ignore_index=True)
+            grouped = pd.concat([grouped, pd.DataFrame([{'Product': 'Locknut', 'Quantity': edg_quantity}])], ignore_index=True)
+            grouped = pd.concat([grouped, pd.DataFrame([{'Product': 'Chase Nipple', 'Quantity': edg_quantity}])], ignore_index=True)
+            grouped = pd.concat([grouped, pd.DataFrame([{'Product': 'HCIM', 'Quantity': hcim_count}])], ignore_index=True)
+            grouped = pd.concat([grouped, pd.DataFrame([{'Product': 'Splicing Connector', 'Quantity': edg_quantity}])], ignore_index=True)
+            grouped = pd.concat([grouped, pd.DataFrame([{'Product': 'BUD Box', 'Quantity': edg_quantity}])], ignore_index=True)
+            grouped = pd.concat([grouped, pd.DataFrame([{'Product': 'BUD Box Insert', 'Quantity': edg_quantity}])], ignore_index=True)
+            grouped = pd.concat([grouped, pd.DataFrame([{'Product': 'HCIM Sleeve', 'Quantity': ceil(hcim_count/7)}])], ignore_index=True)
+            grouped = pd.concat([grouped, pd.DataFrame([{'Product': 'Smart CT Sleeve', 'Quantity': ceil(smartct_count/7)}])], ignore_index=True)
+            grouped = pd.concat([grouped, pd.DataFrame([{'Product': 'EDG Paper End Caps', 'Quantity': edg_quantity*2}])], ignore_index=True)
+            grouped = pd.concat([grouped, pd.DataFrame([{'Product': 'Master Box', 'Quantity': edg_quantity}])], ignore_index=True)
+            grouped = pd.concat([grouped, pd.DataFrame([{'Product': 'Warning Sticker', 'Quantity': edg_quantity}])], ignore_index=True)
+
+        if tg1wwg_quantity > 0:
+            grouped = pd.concat([grouped, pd.DataFrame([{'Product': 'LTE-TG1WWG', 'Quantity': tg1wwg_quantity}])], ignore_index=True)
+            grouped = pd.concat([grouped, pd.DataFrame([{'Product': 'LTE-Antenna', 'Quantity': tg1wwg_quantity}])], ignore_index=True)
+            grouped = pd.concat([grouped, pd.DataFrame([{'Product': 'LTE-Ext. Antenna Base', 'Quantity': tg1wwg_quantity}])], ignore_index=True)
+
+
+        grouped['SKU'] = grouped['Product'].apply(get_sku)
+        cols = ['SKU'] + [col for col in grouped.columns if col != 'SKU']
+        grouped = grouped[cols]
+        grouped = grouped.sort_values(by='SKU').reset_index(drop=True)
+
+        st.subheader("all hardware required from inventory")
+        st.dataframe(grouped)
+
+
+
+    else:
+        st.warning("No rows found in the report.")
+except Exception as e:
+    st.error(f"Error: {e}")
+
+
+
+
